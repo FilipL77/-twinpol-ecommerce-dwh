@@ -1,0 +1,63 @@
+CREATE OR REPLACE VIEW `ecommerce_db.sales_temu_product_profit_final_view` AS
+WITH order_items AS (
+  SELECT
+    order_id,
+    order_date AS date,
+    sku,
+    product_name,
+    SUM(quantity)        AS products_sold,
+    SUM(revenue_pln)     AS revenue_pln,
+    SUM(total_cost_pln)  AS cogs_pln,
+    SUM(profit_pln)      AS profit_pln
+  FROM `ecommerce_db.sales_temu_profit_view`
+  GROUP BY 1,2,3,4
+),
+order_revenue AS (
+  SELECT
+    order_id,
+    SUM(revenue_pln) AS order_revenue_pln
+  FROM order_items
+  GROUP BY 1
+),
+order_shipping_eur AS (
+  -- shipping label cost per order_id in EUR (from ledger)
+  SELECT
+    c.order_id,
+    MIN(c.transaction_date) AS transaction_date,
+    SUM(c.shipping_cost_eur) AS shipping_cost_eur
+  FROM `ecommerce_db.shipping_costs_temu_clean` c
+  GROUP BY 1
+),
+order_shipping_pln AS (
+  -- convert EUR to PLN using daily fx rate by transaction_date
+  SELECT
+    s.order_id,
+    s.transaction_date,
+    s.shipping_cost_eur,
+    (s.shipping_cost_eur * fx.eur_pln) AS shipping_cost_pln
+  FROM order_shipping_eur s
+  LEFT JOIN `ecommerce_db.fx_rates` fx
+    ON fx.date = s.transaction_date
+)
+SELECT
+  i.date,
+  i.sku,
+  i.product_name,
+  i.products_sold,
+  i.revenue_pln,
+  i.cogs_pln,
+
+  -- allocate shipping within order by revenue share
+  (SAFE_DIVIDE(i.revenue_pln, r.order_revenue_pln) * IFNULL(sp.shipping_cost_pln, 0))
+    AS shipping_cost_allocated_pln,
+
+  -- final profit per sku (after allocated shipping)
+  (i.profit_pln
+    - (SAFE_DIVIDE(i.revenue_pln, r.order_revenue_pln) * IFNULL(sp.shipping_cost_pln, 0))
+  ) AS profit_pln_final
+
+FROM order_items i
+LEFT JOIN order_revenue r
+  ON i.order_id = r.order_id
+LEFT JOIN order_shipping_pln sp
+  ON i.order_id = sp.order_id;
