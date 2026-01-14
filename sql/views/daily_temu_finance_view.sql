@@ -23,15 +23,23 @@ ads_daily_eur AS (
 fx_monthly AS (
   SELECT
     month_start_date,
-    CAST(eur_pln_avg AS FLOAT64) AS eur_pln
+    CAST(eur_pln_avg AS FLOAT64) AS eur_pln_avg
   FROM `twinpol-ecommerce.ecommerce_db.fx_rates_clean`
 ),
-shipping_daily AS (
+shipping_financial_daily AS (
   SELECT
     date,
-    -- ważne: 1 rekord dziennie, więc bierzemy wartość jako ANY_VALUE/MAX
+    -- 1 rekord dziennie w view, więc MAX/ANY_VALUE OK
     MAX(shipping_cost_pln) AS shipping_cost_pln
   FROM `twinpol-ecommerce.ecommerce_db.shipping_costs_temu_daily_pln_view`
+  GROUP BY 1
+),
+shipping_labels_daily AS (
+  SELECT
+    date,
+    MAX(shipments) AS shipments,
+    MAX(label_cost_pln) AS shipping_labels_cost_pln
+  FROM `twinpol-ecommerce.ecommerce_db.shipping_costs_temu_label_daily_pln_view`
   GROUP BY 1
 )
 
@@ -41,23 +49,28 @@ SELECT
   s.cogs_pln,
 
   IFNULL(a.ads_cost_eur, 0) AS ads_cost_eur,
-  (IFNULL(a.ads_cost_eur, 0) * fx.eur_pln) AS ads_cost_pln,
+  (IFNULL(a.ads_cost_eur, 0) * fx.eur_pln_avg) AS ads_cost_pln,
 
-  IFNULL(sh.shipping_cost_pln, 0) AS shipping_cost_pln,
+  -- FINANCIAL shipping (net settlement from Temu)
+  IFNULL(sf.shipping_cost_pln, 0) AS shipping_cost_pln,
+
+  -- OPERATIONAL shipping labels (real label purchases)
+  IFNULL(sl.shipments, 0) AS shipments,
+  IFNULL(sl.shipping_labels_cost_pln, 0) AS shipping_labels_cost_pln,
 
   s.orders,
   s.products_sold,
 
-  -- final profit: (revenue - cogs) - ads - shipping_label
+  -- Final profit (P&L): (revenue - cogs) - ads - financial shipping
   (s.profit_pln_net
-    - (IFNULL(a.ads_cost_eur, 0) * fx.eur_pln)
-    - IFNULL(sh.shipping_cost_pln, 0)
+    - (IFNULL(a.ads_cost_eur, 0) * fx.eur_pln_avg)
+    - IFNULL(sf.shipping_cost_pln, 0)
   ) AS profit_pln_final,
 
   SAFE_DIVIDE(
     (s.profit_pln_net
-      - (IFNULL(a.ads_cost_eur, 0) * fx.eur_pln)
-      - IFNULL(sh.shipping_cost_pln, 0)
+      - (IFNULL(a.ads_cost_eur, 0) * fx.eur_pln_avg)
+      - IFNULL(sf.shipping_cost_pln, 0)
     ),
     NULLIF(s.revenue_pln, 0)
   ) AS margin_final
@@ -67,5 +80,7 @@ LEFT JOIN fx_monthly fx
   ON DATE_TRUNC(s.date, MONTH) = fx.month_start_date
 LEFT JOIN ads_daily_eur a
   ON s.date = a.date
-LEFT JOIN shipping_daily sh
-  ON s.date = sh.date;
+LEFT JOIN shipping_financial_daily sf
+  ON s.date = sf.date
+LEFT JOIN shipping_labels_daily sl
+  ON s.date = sl.date;
