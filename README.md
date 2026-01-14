@@ -1,134 +1,225 @@
 # twinpol-ecommerce-dwh
 
-Repozytorium do utrzymania logiki DWH (BigQuery + Looker Studio) dla kanałów e-commerce.
-Na start obsługujemy kanał: **TEMU_DE**.
+Centralny Data Warehouse dla e-commerce (BigQuery + Looker Studio),
+zaprojektowany jako skalowalna architektura pod wiele kanałów sprzedaży.
 
-## Architektura (high-level)
+Aktualnie obsługiwany kanał:
+- **TEMU_DE**
 
-**Źródła (Google Sheets)**
-- `IMPORT_TEMU_RAW` (sales) – arkusz z eksportem sprzedaży Temu
-- `ads_temu_raw` (ads) – arkusz z raportem reklam Temu (dzienne metryki)
-- `import_temu_shipping_costs` (shipping labels) – arkusz z raportem kosztów etykiet / shipping kosztów
+Repozytorium jest **single source of truth** dla:
+- logiki biznesowej (SQL),
+- struktury danych,
+- zasad liczenia revenue, kosztów i marży.
 
-**BigQuery dataset**
-- `twinpol-ecommerce.ecommerce_db`
+---
 
-**Warstwy danych (BQ)**
-1) RAW (tabele docelowe ingestu z arkuszy)
-   - `sales_temu_raw`
-   - `ads_temu_raw`
-   - `shipping_costs_temu_raw` *(uwaga: w projekcie historycznie bywa EXTERNAL – docelowo chcemy mieć zwykłą TABLE, żeby dało się MERGE i dopisywanie)*
+## 🎯 Cel projektu
 
-2) CLEAN / ETL
-   - `ads_temu_clean`
-   - `shipping_costs_temu_clean`
-   - `fx_rates_clean` (z `fx_rates_raw` -> `fx_rates_clean`)
-   - `products` (Master Data: SKU + COGS)
+Celem projektu jest:
+- jednoznaczne liczenie **revenue, COGS, kosztów i profitu**,
+- pełna kontrola nad marżą per dzień i per produkt,
+- oddzielenie:
+  - ingestu danych,
+  - logiki biznesowej,
+  - warstwy raportowej,
+- przygotowanie architektury „na lata” i pod kolejne kanały.
 
-3) VIEWS (do Lookera)
-   - `sales_temu_view` – standaryzacja sprzedaży (SKU, daty, revenue eur)
-   - `sales_temu_profit_view` – revenue_pln, cogs, profit_pln (po COGS), margin
-   - `shipping_costs_temu_daily_pln_view` – dzienne koszty shipping label (PLN)
-   - `sales_temu_product_profit_final_view` – final per SKU/dzień (revenue, cogs, shipping alloc, profit)
-   - `sales_temu_product_profit_daily_view` – tabela TOP produktów (agregacje)
-   - `daily_temu_finance_view` – agregacja dzienna (revenue, cogs, ads, shipping, profit_final, margin)
+---
 
-4) QA (kontrole jakości)
-   - `qa_check__temu_de__cogs_completeness`
-   - `qa_check__fx_rates__coverage_for_shipping_costs`
-   - + ad-hoc sanity checks (opcjonalnie)
+## 🧱 Architektura danych (high-level)
+Google Sheets (RAW exports)
+↓
+BigQuery RAW tables
+↓
+BigQuery CLEAN / ETL
+↓
+BigQuery VIEWS (business logic)
+↓
+Looker Studio (dashboards)
+**Zasada:**  
+> Google Sheets = RAW only  
+> BigQuery = cała logika  
+> Looker = tylko prezentacja
 
-## Struktura repo
+---
 
-- `sql/views/` – widoki raportowe (używane w Looker Studio)
-- `sql/etl/` – zapytania ETL/clean (tworzenie/odświeżanie tabel clean)
-- `sql/qa/` – zapytania QA / sanity check
-- `apps_script/temu_de_ingest/` – Google Apps Script do automatycznego ingestu z Sheets do BigQuery
+## 📂 Źródła danych (Google Sheets)
 
-## Ważne definicje (TEMU_DE)
+### SALES — TEMU_DE
+- Sheet: `IMPORT_TEMU_RAW`
+- Zawiera:
+  - pozycje zamówień,
+  - cenę netto produktu,
+  - kwotę zapłaconą przez klienta za wysyłkę,
+  - ilości,
+  - statusy zamówień.
 
-### Revenue (definicja obowiązkowa)
-Revenue na poziomie pozycji zamówienia = to co zapłacił klient:
-- **AH** = cena netto za sztukę produktu (customer-paid, net)
-- **AR** = kwota jaką klient zapłacił za wysyłkę
+### ADS — TEMU_DE
+- Sheet: `ads_temu_raw`
+- Dzienne dane reklamowe:
+  - spend,
+  - sprzedaż po cenie bazowej,
+  - ROAS, ACOS,
+  - orders, products,
+  - impressions, clicks.
 
-`unit_revenue_eur = AH + AR`
-`line_revenue_eur = unit_revenue_eur * quantity`
+### SHIPPING COSTS — TEMU_DE
+- Sheet: `import_temu_shipping_costs`
+- Koszty wysyłki (shipping labels) ponoszone przez sprzedawcę:
+  - poziom transakcji / order item,
+  - wartości netto.
 
-W BigQuery w `sales_temu_view` pole `price` = `unit_revenue_eur`.
-Pole `total_value` = `line_revenue_eur`.
+### MASTER DATA
+- Sheet: `MAIN_DATABASE`
+  - produkty,
+  - SKU,
+  - COGS,
+  - nazwy produktów,
+  - EAN.
+- Sheet: `FX_RATES`
+  - miesięczne kursy EUR → PLN.
+
+---
+
+## 🗃️ BigQuery – dataset i warstwy
+
+Dataset:
+twinpol-ecommerce.ecommerce_db
+### RAW (mirror danych źródłowych)
+- `sales_temu_raw`
+- `ads_temu_raw`
+- `shipping_costs_temu_raw`
+- `products_raw`
+- `fx_rates_raw`
+
+RAW = brak transformacji, brak logiki biznesowej.
+
+---
+
+### CLEAN / ETL
+- `ads_temu_clean`
+- `shipping_costs_temu_clean`
+- `products`
+- `fx_rates_clean`
+
+Charakterystyka:
+- czyszczenie formatów liczb i dat,
+- standaryzacja typów,
+- przygotowanie danych do joinów.
+
+---
+
+### VIEWS (business / Looker-ready)
+
+#### Kluczowe widoki:
+
+- `sales_temu_view`
+  - grain: **order item**
+  - revenue = *(cena netto produktu + kwota zapłacona przez klienta za wysyłkę)*
+
+- `sales_temu_profit_view`
+  - revenue_pln
+  - cogs_pln (join z `products`)
+  - profit po COGS (bez ads i shipping)
+
+- `shipping_costs_temu_daily_pln_view`
+  - **1 rekord = 1 dzień**
+  - koszt wysyłki w PLN
+
+- `sales_temu_product_profit_final_view`
+  - profit per SKU
+  - uwzględnia COGS i alokację shipping cost
+
+- `sales_temu_product_profit_daily_view`
+  - agregacja dzienna per produkt (TOP produkty)
+
+- `daily_temu_finance_view`
+  - **główna tabela finansowa**
+  - zawiera:
+    - revenue,
+    - COGS,
+    - ads cost (PLN),
+    - shipping cost,
+    - profit final,
+    - margin final.
+
+---
+
+## 💰 Definicje finansowe (OBOWIĄZUJĄCE)
+
+### Revenue
+Revenue jest liczone jako **pełna kwota zapłacona przez klienta**:
+unit_revenue_eur
+= cena netto produktu
+	•	kwota zapłacona przez klienta za wysyłkę
+
+line_revenue_eur
+= unit_revenue_eur * quantity
+Nie odejmujemy:
+- prowizji platformy,
+- podatków.
+
+---
 
 ### Profit
-- `profit_pln` w `sales_temu_profit_view` = `revenue_pln - cogs_pln` (bez ads i bez shipping labels)
-- `profit_pln_final` w `daily_temu_finance_view` = `(revenue - cogs) - ads_cost_pln - shipping_cost_pln`
-- `margin_final` = `profit_pln_final / revenue_pln`
+- **Profit po COGS** (`sales_temu_profit_view`)
+revenue_pln - cogs_pln
+- **Profit final** (`daily_temu_finance_view`)
+(revenue - cogs)
+	•	ads_cost_pln
+	•	shipping_cost_pln
 
-### FX (EUR->PLN)
-- Kursy są liczone miesięcznie, trzymane w `fx_rates_clean`:
-  - `month_start_date` (DATE)
-  - `eur_pln_avg` (NUMERIC/FLOAT)
+- **Margin final**
+profit_pln_final / revenue_pln
+---
 
-## Jak odtworzyć projekt (kolejność)
+## 🔄 Automatyzacja (Apps Script)
 
-### 1) ETL / Clean
-Uruchom kolejno zapytania z `sql/etl/`:
-1. `etl_clean_fx_rates.sql`
-2. `etl_clean_temu_ads.sql`
-3. `etl_clean_temu_de_shipping_costs.sql`
+Folder:
+apps_script/temu_de_ingest/
 
-### 2) Views (Looker)
-Uruchom/odśwież widoki z `sql/views/` (kolejność sugerowana):
-1. `sales_temu_view.sql`
-2. `sales_temu_profit_view.sql`
-3. `shipping_costs_temu_daily_pln_view.sql`
-4. `sales_temu_product_profit_final_view.sql`
-5. `sales_temu_product_profit_daily_view.sql`
-6. `daily_temu_finance_view.sql`
+Apps Script:
+- pobiera dane z Google Sheets,
+- ładuje je do BigQuery,
+- **dopisywane są tylko nowe rekordy** (brak nadpisywania historii).
 
-### 3) QA
-Uruchom zapytania z `sql/qa/` i sprawdź wyniki:
-- brakujące COGS / brak SKU w `products`
-- brak kursów FX dla miesięcy, w których jest shipping/ads
+Funkcje:
+- `run_hourly_ingest__temu_de_sales`
+- `run_hourly_ingest__temu_de_ads`
+- `run_hourly_ingest__temu_de_shipping_costs`
 
-## Apps Script – automatyczny ingest
+**WAŻNE:**
+- Apps Script NIE zawiera logiki biznesowej,
+- cała logika znajduje się w SQL (BigQuery).
 
-### Cel
-Co godzinę (lub ręcznie) pobiera dane z 3 Google Sheets i dopisuje tylko nowe rekordy do tabel RAW w BigQuery.
+---
 
-### Konfiguracja
-W `apps_script/temu_de_ingest/code.gs` ustaw:
-- `PROJECT_ID = "twinpol-ecommerce"`
-- `DATASET_ID = "ecommerce_db"`
+## 🧪 QA / Sanity checks
 
-**Sheet IDs**
-- sales: `1Y1P2HxNUM4H9Jg5YC6SwZFwCgBc1Iw0b5d2vRpNT4s0`
-- ads: `1i2eJntg15U6PEoEryJ_rq94I-cckQP0HVIA2be1fXsc`
-- shipping: `1NuMPV5_Me4IcsXxoZiixsgWnaU3L_eZa7In_pfbBnts`
+Folder:
+sql/qa/
 
-**Docelowe tabele**
-- sales -> `sales_temu_raw`
-- ads -> `ads_temu_raw`
-- shipping -> `shipping_costs_temu_raw` (docelowo TABLE, nie EXTERNAL)
+Zawiera:
+- sprawdzenie kompletności COGS (products),
+- sprawdzenie pokrycia kursów FX,
+- sanity checki używane przy zmianach ingestu.
 
-### Triggery
-W Apps Script: Triggers → Add Trigger:
-- function: `run_hourly_ingest__temu_de_sales` (czasowy, hourly)
-- function: `run_hourly_ingest__temu_de_ads` (czasowy, hourly)
-- function: `run_hourly_ingest__temu_de_shipping_costs` (czasowy, hourly)
+---
 
-### Uwaga dot. uprawnień
-Skrypt wymaga uprawnień do:
-- Google Sheets (odczyt)
-- BigQuery (load + query/merge)
+## 🛑 Zasady projektu
 
-## Master Data (products, fx)
-Master Data jest utrzymywana osobno (Sheets -> BQ) i zasila:
-- `products` (SKU + COGS + nazwy)
-- `fx_rates_clean` (miesięczne kursy EUR/PLN)
+- Repo = **single source of truth**
+- Naprawiamy istniejące obiekty, **nie tworzymy duplikatów**
+- RAW ≠ CLEAN ≠ VIEW
+- Looker:
+  - nie liczy logiki,
+  - tylko prezentuje dane z VIEWS.
 
-W kolejnych krokach automatyzujemy także ingest Master Data.
+---
 
-## Zasada „naprawiamy stare, nie tworzymy nowe”
-- W BQ utrzymujemy stałe nazwy tabel i view.
-- Zmiany robimy przez `CREATE OR REPLACE VIEW` / kontrolowane `CREATE OR REPLACE TABLE`.
-- Repo jest „single source of truth” dla SQL i skryptów ingest.
+## 🔜 Kolejne etapy
+
+- automatyczny ingest **master data (products, fx)**,
+- kolejne kanały sprzedaży,
+- unified multi-channel schema.
+
