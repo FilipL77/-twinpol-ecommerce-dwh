@@ -23,7 +23,7 @@ var SALES_STAGING_TABLE = 'sales_temu_raw_staging';
 var ADS_STAGING_TABLE = 'ads_temu_raw_staging';
 var SHIPPING_STAGING_TABLE = 'shipping_costs_temu_raw_staging';
 
-/*** SHIPPING CANONICAL COLS (23) - WITHOUT ingested_at ***/
+/*** SHIPPING CANONICAL COLS (23) - WITHOUT ingested_at + WITHOUT row_hash ***/
 var SHIPPING_COLS = [
   'date_time',
   'transaction_type',
@@ -38,11 +38,15 @@ var SHIPPING_COLS = [
   'retail_price',
   'platform_discount',
   'seller_discount',
-  'service_fee__tax_incl__',
+
+  // ✅ canonicalized names (no double/triple underscores)
+  'service_fee_tax_incl',
+
   'platform_incentive',
   'subtotal',
   'shipping',
-  'platform_incentive___shipping',
+  'platform_incentive_shipping',
+
   'product_tax',
   'shipping_tax',
   'others',
@@ -69,8 +73,8 @@ function run_hourly_ingest__temu_de_sales() {
     SALES_TARGET_TABLE,
     getSchema_sales_temu_raw_(),
     getMergeSql_sales_(),
-    true,
-    true // include ingested_at in CSV
+    true,   // ensure ingested_at on target
+    true    // include ingested_at in CSV
   );
 }
 
@@ -95,8 +99,8 @@ function run_hourly_ingest__temu_de_ads() {
     ADS_TARGET_TABLE,
     buildAllStringSchema_(appendIngestedAtHeader_(obj.headers)),
     getMergeSql_ads_(keyCol),
-    false,
-    true // include ingested_at in CSV (STRING ok)
+    false,  // do NOT ALTER external etc
+    true    // include ingested_at in CSV (STRING ok)
   );
 }
 
@@ -109,18 +113,18 @@ function run_hourly_ingest__temu_de_shipping_costs() {
 
   var obj = mapGenericSheetToCanonical_(sheet);
 
-  // Ensure target exists with correct schema (23 strings + ingested_at timestamp)
+  // ✅ Ensure target exists with correct schema (typed + ingested_at + row_hash)
   ensureBaseTableExists_(SHIPPING_TARGET_TABLE, getSchema_shipping_target_());
 
-  // IMPORTANT: staging has ONLY 23 columns (no ingested_at)
+  // ✅ Staging is all strings and has ONLY canonical sheet headers (no ingested_at, no row_hash)
   ingestGeneric_(
     'shipping_costs',
     obj.headers,
     obj.rows,
     SHIPPING_STAGING_TABLE,
     SHIPPING_TARGET_TABLE,
-    buildAllStringSchema_(obj.headers),       // staging all strings
-    getMergeSql_shipping_costs_fixed_(),      // explicit INSERT with ingested_at
+    buildAllStringSchema_(obj.headers),
+    getMergeSql_shipping_costs_by_hash_(),
     false,
     false // do NOT include ingested_at in CSV
   );
@@ -155,6 +159,13 @@ function ingestGeneric_(entity, canonicalHeaders, canonicalRows, stagingTable, t
   var blob = Utilities.newBlob(csv, 'text/csv', entity + '_staging.csv');
 
   bqLoadCsvToStaging_(stagingTable, headers, blob, schema);
+
+  // 🔎 Debug safety
+  Logger.log('MERGE SQL type: ' + (typeof mergeSql));
+  Logger.log('MERGE SQL (first 200 chars): ' + String(mergeSql).slice(0, 200));
+  if (typeof mergeSql !== 'string') throw new Error('mergeSql is not a string. Did you forget ()? entity=' + entity);
+  if (/^\s*function\s+/i.test(mergeSql)) throw new Error('mergeSql starts with "function" — wrong value passed.');
+
   runBqQuery_(mergeSql);
 
   Logger.log('DONE: ' + entity);
@@ -224,7 +235,7 @@ function runBqQuery_(sql) {
 }
 
 function waitForJobDone_(jobId) {
-  for (var i = 0; i < 120; i++) {
+  for (var i = 0; i < 180; i++) {
     var job = BigQuery.Jobs.get(PROJECT_ID, jobId, { location: LOCATION });
     var state = job.status && job.status.state ? job.status.state : '';
     if (state === 'DONE') {
@@ -249,6 +260,7 @@ function mapSales_IMPORT_TEMU_RAW_toCanonical_(sheet) {
     return n - 1;
   }
 
+  // Revenue logic: AH (product net price per unit) + AR (customer paid shipping)
   var IDX_ITEM_PRICE_AH = colIndex_('AH');
   var IDX_CUST_SHIP_AR = colIndex_('AR');
 
@@ -364,37 +376,91 @@ function getMergeSql_ads_(keyCol) {
     + 'WHEN NOT MATCHED THEN INSERT ROW;\n';
 }
 
-/*** ✅ SHIPPING MERGE: explicit INSERT to add ingested_at ***/
-function getMergeSql_shipping_costs_fixed_() {
+/*** ✅ SHIPPING MERGE: merge by row_hash, insert typed columns ***/
+function getMergeSql_shipping_costs_by_hash_() {
   var T = '`' + PROJECT_ID + '.' + DATASET_ID + '.' + SHIPPING_TARGET_TABLE + '`';
   var S = '`' + PROJECT_ID + '.' + DATASET_ID + '.' + SHIPPING_STAGING_TABLE + '`';
 
-  var colList = SHIPPING_COLS.join(', ');
-  var sColList = SHIPPING_COLS.map(function(c){ return 'S.' + c; }).join(', ');
+  // Compute row_hash from STAGING (strings)
+  var hashExpr =
+    "TO_HEX(MD5(CONCAT(" +
+      "IFNULL(CAST(date_time AS STRING), ''), '|'," +
+      "IFNULL(transaction_type, ''), '|'," +
+      "IFNULL(related_id, ''), '|'," +
+      "IFNULL(order_id, ''), '|'," +
+      "IFNULL(order_item_id, ''), '|'," +
+      "IFNULL(sku, ''), '|'," +
+      "IFNULL(CAST(sku_id AS STRING), ''), '|'," +
+      "IFNULL(CAST(quantity AS STRING), ''), '|'," +
+      "IFNULL(ship_city, ''), '|'," +
+      "IFNULL(ship_state, ''), '|'," +
+      "IFNULL(CAST(retail_price AS STRING), ''), '|'," +
+      "IFNULL(CAST(platform_discount AS STRING), ''), '|'," +
+      "IFNULL(CAST(seller_discount AS STRING), ''), '|'," +
+      "IFNULL(CAST(service_fee_tax_incl AS STRING), ''), '|'," +
+      "IFNULL(CAST(platform_incentive AS STRING), ''), '|'," +
+      "IFNULL(CAST(subtotal AS STRING), ''), '|'," +
+      "IFNULL(CAST(shipping AS STRING), ''), '|'," +
+      "IFNULL(CAST(platform_incentive_shipping AS STRING), ''), '|'," +
+      "IFNULL(CAST(product_tax AS STRING), ''), '|'," +
+      "IFNULL(CAST(shipping_tax AS STRING), ''), '|'," +
+      "IFNULL(CAST(others AS STRING), ''), '|'," +
+      "IFNULL(CAST(total AS STRING), ''), '|'," +
+      "IFNULL(currency, '')" +
+    ")))";
 
-  // dedupe staging to avoid "MERGE must match at most one"
+  // Dedupe staging by row_hash to avoid "MERGE must match at most one"
   return ''
     + 'MERGE ' + T + ' T\n'
     + 'USING (\n'
     + '  SELECT * EXCEPT(rn)\n'
     + '  FROM (\n'
-    + '    SELECT S.*,\n'
-    + '      ROW_NUMBER() OVER (\n'
-    + '        PARTITION BY COALESCE(CAST(date_time AS STRING), \'\'), COALESCE(CAST(transaction_type AS STRING), \'\'), COALESCE(CAST(order_id AS STRING), \'\'), COALESCE(CAST(order_item_id AS STRING), \'\')\n'
-    + '        ORDER BY 1\n'
-    + '      ) AS rn\n'
+    + '    SELECT\n'
+    + '      S.*,\n'
+    + '      ' + hashExpr + ' AS row_hash,\n'
+    + '      ROW_NUMBER() OVER (PARTITION BY ' + hashExpr + ' ORDER BY 1) AS rn\n'
     + '    FROM ' + S + ' S\n'
     + '  )\n'
     + '  WHERE rn = 1\n'
     + ') S\n'
-    + 'ON COALESCE(CAST(T.date_time AS STRING), \'\') = COALESCE(CAST(S.date_time AS STRING), \'\')\n'
-    + 'AND COALESCE(CAST(T.transaction_type AS STRING), \'\') = COALESCE(CAST(S.transaction_type AS STRING), \'\')\n'
-    + 'AND COALESCE(CAST(T.order_id AS STRING), \'\') = COALESCE(CAST(S.order_id AS STRING), \'\')\n'
-    + 'AND COALESCE(CAST(T.order_item_id AS STRING), \'\') = COALESCE(CAST(S.order_item_id AS STRING), \'\')\n'
+    + 'ON T.row_hash = S.row_hash\n'
     + 'WHEN MATCHED THEN UPDATE SET ingested_at = CURRENT_TIMESTAMP()\n'
     + 'WHEN NOT MATCHED THEN\n'
-    + '  INSERT (' + colList + ', ingested_at)\n'
-    + '  VALUES (' + sColList + ', CURRENT_TIMESTAMP());\n';
+    + '  INSERT (\n'
+    + '    date_time, transaction_type, related_id, order_id, order_item_id, sku,\n'
+    + '    sku_id, quantity, ship_city, ship_state,\n'
+    + '    retail_price, platform_discount, seller_discount, service_fee_tax_incl,\n'
+    + '    platform_incentive, subtotal, shipping, platform_incentive_shipping,\n'
+    + '    product_tax, shipping_tax, others, total, currency,\n'
+    + '    ingested_at, row_hash\n'
+    + '  )\n'
+    + '  VALUES (\n'
+    + '    SAFE_CAST(NULLIF(S.date_time, \'\') AS TIMESTAMP),\n'
+    + '    S.transaction_type,\n'
+    + '    S.related_id,\n'
+    + '    S.order_id,\n'
+    + '    S.order_item_id,\n'
+    + '    S.sku,\n'
+    + '    SAFE_CAST(NULLIF(S.sku_id, \'\') AS INT64),\n'
+    + '    SAFE_CAST(NULLIF(S.quantity, \'\') AS INT64),\n'
+    + '    S.ship_city,\n'
+    + '    S.ship_state,\n'
+    + '    SAFE_CAST(NULLIF(S.retail_price, \'\') AS INT64),\n'
+    + '    SAFE_CAST(NULLIF(S.platform_discount, \'\') AS INT64),\n'
+    + '    SAFE_CAST(NULLIF(S.seller_discount, \'\') AS INT64),\n'
+    + '    SAFE_CAST(NULLIF(S.service_fee_tax_incl, \'\') AS INT64),\n'
+    + '    SAFE_CAST(NULLIF(S.platform_incentive, \'\') AS INT64),\n'
+    + '    SAFE_CAST(NULLIF(S.subtotal, \'\') AS INT64),\n'
+    + '    SAFE_CAST(NULLIF(S.shipping, \'\') AS INT64),\n'
+    + '    SAFE_CAST(NULLIF(S.platform_incentive_shipping, \'\') AS INT64),\n'
+    + '    SAFE_CAST(NULLIF(S.product_tax, \'\') AS INT64),\n'
+    + '    SAFE_CAST(NULLIF(S.shipping_tax, \'\') AS INT64),\n'
+    + '    SAFE_CAST(NULLIF(S.others, \'\') AS INT64),\n'
+    + '    SAFE_CAST(NULLIF(S.total, \'\') AS INT64),\n'
+    + '    S.currency,\n'
+    + '    CURRENT_TIMESTAMP(),\n'
+    + '    S.row_hash\n'
+    + '  );\n';
 }
 
 /***** SCHEMAS *****/
@@ -414,11 +480,34 @@ function getSchema_sales_temu_raw_() {
 }
 
 function getSchema_shipping_target_() {
-  // target: same 23 cols as staging (STRING) + ingested_at TIMESTAMP
-  var fields = [];
-  for (var i = 0; i < SHIPPING_COLS.length; i++) fields.push({ name: SHIPPING_COLS[i], type: 'STRING' });
-  fields.push({ name: 'ingested_at', type: 'TIMESTAMP' });
-  return fields;
+  // ✅ Must match your existing target schema (typed)
+  return [
+    { name: 'date_time', type: 'TIMESTAMP' },
+    { name: 'transaction_type', type: 'STRING' },
+    { name: 'related_id', type: 'STRING' },
+    { name: 'order_id', type: 'STRING' },
+    { name: 'order_item_id', type: 'STRING' },
+    { name: 'sku', type: 'STRING' },
+    { name: 'sku_id', type: 'INT64' },
+    { name: 'quantity', type: 'INT64' },
+    { name: 'ship_city', type: 'STRING' },
+    { name: 'ship_state', type: 'STRING' },
+    { name: 'retail_price', type: 'INT64' },
+    { name: 'platform_discount', type: 'INT64' },
+    { name: 'seller_discount', type: 'INT64' },
+    { name: 'service_fee_tax_incl', type: 'INT64' },
+    { name: 'platform_incentive', type: 'INT64' },
+    { name: 'subtotal', type: 'INT64' },
+    { name: 'shipping', type: 'INT64' },
+    { name: 'platform_incentive_shipping', type: 'INT64' },
+    { name: 'product_tax', type: 'INT64' },
+    { name: 'shipping_tax', type: 'INT64' },
+    { name: 'others', type: 'INT64' },
+    { name: 'total', type: 'INT64' },
+    { name: 'currency', type: 'STRING' },
+    { name: 'ingested_at', type: 'TIMESTAMP' },
+    { name: 'row_hash', type: 'STRING' }
+  ];
 }
 
 function buildAllStringSchema_(headers) {
@@ -459,6 +548,7 @@ function canonicalizeHeader_(h) {
   s = s.replace(/ą/g,'a').replace(/ć/g,'c').replace(/ę/g,'e').replace(/ł/g,'l').replace(/ń/g,'n').replace(/ó/g,'o').replace(/ś/g,'s').replace(/ż/g,'z').replace(/ź/g,'z');
   s = s.replace(/[\s\-\/]+/g, '_');
   s = s.replace(/[^a-z0-9_]/g, '');
+  s = s.replace(/_+/g, '_'); // collapse multiple underscores
   if (/^[0-9]/.test(s)) s = 'col_' + s;
   if (!s) s = 'col_unnamed';
   return s;
